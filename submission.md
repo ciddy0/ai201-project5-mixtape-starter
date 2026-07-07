@@ -295,3 +295,47 @@ and each appears exactly once. Tag data is unaffected because `Song.to_dict()` s
 reads `tags` from the relationship. `get_song()` in the same file never used the join, so
 it is unchanged. The full suite's only failures remain the pre-existing, still-open Issue
 #5 playlist tests, unrelated to this change.
+
+## Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it:** Following aaliya's report, I exercised both notification paths
+against an in-memory DB inside an app context. I created a sharer and a separate friend,
+had the friend rate a song the sharer had shared (`rate_song(friend_id, song_id, 5)`),
+then read the sharer's notifications with `get_notifications(sharer_id)`. Before the fix
+the list came back empty even though the `Rating` row was saved — exactly aaliya's symptom:
+the rating persists (shows on the song) but no notification is ever created. As the control,
+the playlist-add path (`add_to_playlist`) did produce a notification, confirming the gap was
+specific to rating.
+
+**How I found the root cause:** I traced from `POST /songs/<song_id>/rate` in
+`routes/songs.py`, which delegates to `notification_service.rate_song()`. The tell was that
+both the working and broken behaviors live in the *same file*, `notification_service.py`, so
+I compared them line-by-line. `add_to_playlist()` ends with an explicit block (lines 64–70):
+after committing, `if song.shared_by != added_by_user_id: create_notification(...)`.
+`rate_song()` had the same shape — validate score, load `song` and `rater`, upsert the
+`Rating`, `db.session.commit()` — but then simply `return rating`. It never called
+`create_notification` at all. This isn't a typo or a wrong comparison; the entire
+notification step that the playlist path has was structurally absent from the rating path,
+which is why "ratings notifications just don't happen, for anyone."
+
+**The root cause:** `rate_song()` performed only the persistence half of the operation. It
+saved (or updated) the `Rating` and returned, with no call to `create_notification`. The
+notification side of the "friend interacts with your shared song → notify the sharer"
+contract — present and correct in `add_to_playlist` — was missing entirely from
+`rate_song`, so no `Notification` row was ever written for a rating and nothing appeared in
+`GET /users/<id>/notifications`.
+
+**My fix and side-effect check:** I added the missing notification block to `rate_song()`,
+mirroring `add_to_playlist` exactly: after the commit, `if song.shared_by != user_id:` call
+`create_notification(user_id=song.shared_by, notification_type="song_rated", body=f"{rater.username} rated your song '{song.title}' {score} stars.")`.
+I used the type string `"song_rated"` — the value `create_notification`'s own docstring
+names as the rating example — and reused the existing shared `create_notification` writer
+rather than duplicating insert logic. The `song.shared_by != user_id` guard matches the
+playlist path's rule that adding/rating *your own* song notifies nobody. I verified end to
+end: a friend's rating now creates exactly one `song_rated` notification addressed to the
+sharer with the expected body, and a self-rating creates none (notification count stays put).
+For side effects, the rating upsert itself is untouched — the notification runs strictly
+after the existing commit, so a repeat rating still updates the same `Rating` row (unique
+`(user_id, song_id)` constraint) and doesn't disturb `add_to_playlist`, which shares the
+`create_notification` writer. The full suite's only failures remain the pre-existing,
+still-open Issue #5 playlist tests, unrelated to this change.
