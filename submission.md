@@ -253,12 +253,12 @@ recency filter, so it is unchanged. I confirmed it still returns all 8 seeded ev
 regardless of age. The full test suite's only failures are the pre-existing, still-open
 Issue #5 playlist tests, which are unrelated to this change.
 
-## Issue #3 — The same song keeps showing up twice in search
+## Issue #3: The same song keeps showing up twice in search
 
 **How I reproduced it:** Following simone's report, I worked from the existing
 `tests/test_search.py`, whose seed fixture deliberately creates one song with no tags
 (*Midnight Drive*), one with a single tag (*Block Party*), and one with three tags
-(*Crown Heights Anthem* by Borough Kings — the exact song simone named). Running
+(*Crown Heights Anthem* by Borough Kings, the exact song simone named). Running
 `pytest tests/test_search.py` before the fix, `test_search_no_duplicates_multi_tag_song`
 failed: searching "Crown Heights" returned the three-tag song three times, while the
 zero- and one-tag songs each returned once. That reproduced simone's "some appear once,
@@ -279,10 +279,10 @@ per association row, which is exactly a 3-tag → 3-row mapping.
 `LEFT OUTER JOIN` produces one result row for every matching row on the joined side, so a
 song with N `song_tags` rows came back N times; a song with one tag came back once, and a
 song with zero tags came back once (the NULL side of the outer join). Because the query
-selected only the `Song` entity and never used the joined `song_tags` columns — the filter
+selected only the `Song` entity and never used the joined `song_tags` columns, the filter
 matches on `Song.title`/`Song.artist`, and each song's tags are loaded independently through
 the `tags = db.relationship("Tag", secondary=song_tags, lazy="subquery")` relationship used
-by `Song.to_dict()` — the join contributed nothing but row duplication.
+by `Song.to_dict()`, the join contributed nothing but row duplication.
 
 **My fix and side-effect check:** I removed the spurious `.outerjoin(...)` line from
 `search_songs()` (and dropped the now-unused `song_tags` import). This eliminates the
@@ -296,13 +296,13 @@ reads `tags` from the relationship. `get_song()` in the same file never used the
 it is unchanged. The full suite's only failures remain the pre-existing, still-open Issue
 #5 playlist tests, unrelated to this change.
 
-## Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it
+## Issue #4: I got notified when a friend added my song to a playlist but not when they rated it
 
 **How I reproduced it:** Following aaliya's report, I exercised both notification paths
 against an in-memory DB inside an app context. I created a sharer and a separate friend,
 had the friend rate a song the sharer had shared (`rate_song(friend_id, song_id, 5)`),
 then read the sharer's notifications with `get_notifications(sharer_id)`. Before the fix
-the list came back empty even though the `Rating` row was saved — exactly aaliya's symptom:
+the list came back empty even though the `Rating` row was saved, exactly aaliya's symptom:
 the rating persists (shows on the song) but no notification is ever created. As the control,
 the playlist-add path (`add_to_playlist`) did produce a notification, confirming the gap was
 specific to rating.
@@ -310,10 +310,10 @@ specific to rating.
 **How I found the root cause:** I traced from `POST /songs/<song_id>/rate` in
 `routes/songs.py`, which delegates to `notification_service.rate_song()`. The tell was that
 both the working and broken behaviors live in the *same file*, `notification_service.py`, so
-I compared them line-by-line. `add_to_playlist()` ends with an explicit block (lines 64–70):
+I compared them line-by-line. `add_to_playlist()` ends with an explicit block (lines 64-70):
 after committing, `if song.shared_by != added_by_user_id: create_notification(...)`.
-`rate_song()` had the same shape — validate score, load `song` and `rater`, upsert the
-`Rating`, `db.session.commit()` — but then simply `return rating`. It never called
+`rate_song()` had the same shape, validate score, load `song` and `rater`, upsert the
+`Rating`, `db.session.commit()`, but then simply `return rating`. It never called
 `create_notification` at all. This isn't a typo or a wrong comparison; the entire
 notification step that the playlist path has was structurally absent from the rating path,
 which is why "ratings notifications just don't happen, for anyone."
@@ -321,21 +321,60 @@ which is why "ratings notifications just don't happen, for anyone."
 **The root cause:** `rate_song()` performed only the persistence half of the operation. It
 saved (or updated) the `Rating` and returned, with no call to `create_notification`. The
 notification side of the "friend interacts with your shared song → notify the sharer"
-contract — present and correct in `add_to_playlist` — was missing entirely from
+contract, present and correct in `add_to_playlist`, was missing entirely from
 `rate_song`, so no `Notification` row was ever written for a rating and nothing appeared in
 `GET /users/<id>/notifications`.
 
 **My fix and side-effect check:** I added the missing notification block to `rate_song()`,
 mirroring `add_to_playlist` exactly: after the commit, `if song.shared_by != user_id:` call
 `create_notification(user_id=song.shared_by, notification_type="song_rated", body=f"{rater.username} rated your song '{song.title}' {score} stars.")`.
-I used the type string `"song_rated"` — the value `create_notification`'s own docstring
-names as the rating example — and reused the existing shared `create_notification` writer
+I used the type string `"song_rated"`, the value `create_notification`'s own docstring
+names as the rating example, and reused the existing shared `create_notification` writer
 rather than duplicating insert logic. The `song.shared_by != user_id` guard matches the
 playlist path's rule that adding/rating *your own* song notifies nobody. I verified end to
 end: a friend's rating now creates exactly one `song_rated` notification addressed to the
 sharer with the expected body, and a self-rating creates none (notification count stays put).
-For side effects, the rating upsert itself is untouched — the notification runs strictly
+For side effects, the rating upsert itself is untouched, the notification runs strictly
 after the existing commit, so a repeat rating still updates the same `Rating` row (unique
 `(user_id, song_id)` constraint) and doesn't disturb `add_to_playlist`, which shares the
 `create_notification` writer. The full suite's only failures remain the pre-existing,
 still-open Issue #5 playlist tests, unrelated to this change.
+
+## Issue #5: The last song in a playlist never shows up
+
+**How I reproduced it:** Following darius's report, the two existing playlist tests in
+`tests/test_playlists.py` already model it exactly. `test_playlist_returns_all_songs` seeds
+a five-song playlist and asserts all five titles come back; `test_playlist_returns_songs_in_order`
+asserts the full ordered list. Before the fix, `pytest tests/test_playlists.py` showed both
+failing, `get_playlist_songs` returned only `["Track 1"..."Track 4"]`, dropping `Track 5`,
+the last (most recently added) song. That reproduced darius's "always exactly one missing,
+always the newest" symptom, and the "adding another frees the previous one" behavior follows
+directly: whichever song currently sits at the highest position is the one hidden.
+
+**How I found the root cause:** I traced from `GET /playlists/<playlist_id>/songs` in
+`routes/playlists.py`, which delegates to `playlist_service.get_playlist_songs()`. That
+function builds the correct query, join `playlist_entries`, filter by playlist, order by
+`asc(position)`, so the ordering and count were right up to the last line. The return
+statement, `return [song.to_dict() for song in songs[:-1]]`, was the moment it clicked: the
+`[:-1]` slice discards the final element of an already-correctly-ordered list, and the
+function's own docstring says "This function returns all songs in the playlist." The mismatch
+between the slice and the documented contract pinpointed the exact cause.
+
+**The root cause:** `get_playlist_songs` correctly queried and ordered every playlist song
+ascending by `playlist_entries.position`, but its return statement sliced the result with
+`songs[:-1]`, which drops the last element of a list. Because the list is sorted by ascending
+position and each newly added song gets the highest position, the dropped element was always
+the most recently added song. The playlist's stored count (7) reflected all entries while the
+returned list (6) was one short, always missing the newest, exactly the reported behavior.
+
+**My fix and side-effect check:** I changed the return to iterate the full result,
+`return [song.to_dict() for song in songs]`, removing the `[:-1]` slice so every song in the
+playlist is returned in position order as the docstring promises. This is a one-token change
+that leaves the query, ordering, and not-found handling untouched. I ran the full suite:
+`pytest` now reports 13 passed, 0 failed, both `test_playlist_returns_all_songs` and
+`test_playlist_returns_songs_in_order` pass, confirming all songs return in the correct order.
+I verified the boundary on both sides: a populated playlist returns its complete, ordered set
+including the newest song, and an empty playlist yields `[]` (slicing was the only thing that
+could have masked an empty list, and `[]` iterates to `[]` cleanly). No other function reads
+through `get_playlist_songs`, and `add_to_playlist` (which appends entries) is unaffected, so
+nothing else depends on the old truncating behavior.
