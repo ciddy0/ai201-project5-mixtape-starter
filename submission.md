@@ -252,3 +252,46 @@ nowhere else (confirmed by grep), and `get_activity_feed()` in the same file app
 recency filter, so it is unchanged. I confirmed it still returns all 8 seeded events
 regardless of age. The full test suite's only failures are the pre-existing, still-open
 Issue #5 playlist tests, which are unrelated to this change.
+
+## Issue #3 — The same song keeps showing up twice in search
+
+**How I reproduced it:** Following simone's report, I worked from the existing
+`tests/test_search.py`, whose seed fixture deliberately creates one song with no tags
+(*Midnight Drive*), one with a single tag (*Block Party*), and one with three tags
+(*Crown Heights Anthem* by Borough Kings — the exact song simone named). Running
+`pytest tests/test_search.py` before the fix, `test_search_no_duplicates_multi_tag_song`
+failed: searching "Crown Heights" returned the three-tag song three times, while the
+zero- and one-tag songs each returned once. That reproduced simone's "some appear once,
+others two or three times, for a single-song match" symptom and showed the duplicate
+count tracked a song's tag count.
+
+**How I found the root cause:** I traced from the endpoint simone hit,
+`GET /songs/search?q=` in `routes/songs.py`, which delegates (per the route→service
+pattern) to `search_service.search_songs()`. Reading that function in
+`services/search_service.py`, the query selected only `Song` but chained an
+`.outerjoin(song_tags, Song.id == song_tags.c.song_id)`. The moment I connected "duplicate
+count equals tag count" to a join against the many-to-many `song_tags` association table, I
+was confident this was the cause rather than a suspicious area: a left join fans out one row
+per association row, which is exactly a 3-tag → 3-row mapping.
+
+**The root cause:** `search_songs()` issued
+`db.session.query(Song).outerjoin(song_tags, Song.id == song_tags.c.song_id)`. A SQL
+`LEFT OUTER JOIN` produces one result row for every matching row on the joined side, so a
+song with N `song_tags` rows came back N times; a song with one tag came back once, and a
+song with zero tags came back once (the NULL side of the outer join). Because the query
+selected only the `Song` entity and never used the joined `song_tags` columns — the filter
+matches on `Song.title`/`Song.artist`, and each song's tags are loaded independently through
+the `tags = db.relationship("Tag", secondary=song_tags, lazy="subquery")` relationship used
+by `Song.to_dict()` — the join contributed nothing but row duplication.
+
+**My fix and side-effect check:** I removed the spurious `.outerjoin(...)` line from
+`search_songs()` (and dropped the now-unused `song_tags` import). This eliminates the
+row fan-out at its source rather than masking it with `.distinct()`, and returns the
+query to plainly selecting songs whose title or artist matches. I ran
+`pytest tests/test_search.py -v`: all 5 tests pass, including the multi-tag,
+single-tag, and no-tag no-duplicate cases (both sides of the "how many tags" boundary)
+and `test_search_returns_matching_songs`, confirming matching songs are still returned
+and each appears exactly once. Tag data is unaffected because `Song.to_dict()` still
+reads `tags` from the relationship. `get_song()` in the same file never used the join, so
+it is unchanged. The full suite's only failures remain the pre-existing, still-open Issue
+#5 playlist tests, unrelated to this change.
