@@ -210,3 +210,45 @@ increment on exactly one day's gap, reset only when more than one day is skipped
 `test_streak_resets_after_skipped_day` still passes, verifying that a genuine skipped day
 (Monday → Wednesday, `days_since_last == 2`) still correctly resets to 1 — the reset path
 is unaffected, only the false Sunday reset is gone.
+
+## Issue #2 — "Friends Listening Now" shows people from yesterday
+
+**How I reproduced it:** Following nova's report, I seeded the DB (`python seed_data.py`)
+and called `get_friends_listening_now(nova_id)` inside an app context. To reproduce the
+exact symptom of an evening listen lingering into the next morning, I gave a friend
+(simone) a single ListeningEvent timestamped 30 minutes before today's UTC midnight. That
+event was still only about 21 hours old. Before the fix she appeared in the feed even
+though her only listen was the previous day, because a rolling 24-hour window still counted
+it as under 24 hours old. This matches nova seeing darius's 11pm listen the next morning.
+
+**How I found the root cause:** I traced from the endpoint nova hit,
+`GET /feed/<user_id>/listening-now` in `routes/feed.py`, which delegates straight to
+`feed_service.get_friends_listening_now()` following the route-to-service pattern. Reading
+that function in `services/feed_service.py`, the cutoff computation stood out immediately.
+It subtracted a `RECENT_THRESHOLD = timedelta(hours=24)` constant from the current time.
+The "hangs around until the same time next day" phrasing in the report is the exact
+signature of a sliding window anchored to the current instant rather than to midnight,
+which confirmed this line was the cause rather than just a suspicious area.
+
+**The root cause:** The cutoff was `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`
+with `RECENT_THRESHOLD = timedelta(hours=24)`, and the query filtered
+`ListeningEvent.listened_at >= cutoff`. This is a rolling 24-hour window measured backward
+from the current moment rather than a calendar-day boundary. An event at 11pm yesterday
+stays above the cutoff until 11pm today, so "listened now" or "listened today" effectively
+meant "listened in the last 24 hours." A friend whose last listen was yesterday evening
+kept showing until the same clock time the next day.
+
+**My fix and side-effect check:** In `services/feed_service.py` I replaced the rolling
+cutoff with today's UTC midnight, using
+`cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)`,
+and removed the now-unused `RECENT_THRESHOLD` constant along with the now-unused
+`timedelta` import. UTC midnight is the right anchor because every timestamp in the app is
+stored and compared in UTC (`models.py`) and there is no per-user timezone. I kept the `>=`
+comparison so an event exactly at 00:00:00 today counts as today while 23:59:59 yesterday
+does not, and I verified both sides of that boundary directly. I confirmed the three seeded
+friends with minutes-ago listens still appear, and that a friend whose only listen was
+before today's midnight is now excluded. For side effects, `RECENT_THRESHOLD` is referenced
+nowhere else (confirmed by grep), and `get_activity_feed()` in the same file applies no
+recency filter, so it is unchanged. I confirmed it still returns all 8 seeded events
+regardless of age. The full test suite's only failures are the pre-existing, still-open
+Issue #5 playlist tests, which are unrelated to this change.
